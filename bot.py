@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
-import io, os, re, json, csv
+import os, io, re, json, csv, gzip, asyncio
 from datetime import date
 from typing import Dict, Any, List, Optional
 
+import requests
 from dateutil import parser as dateparser
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- Dépts -> Régions (métropole + DROM simplifié) ---
+# ====== Départements -> Régions (métropole + DROM simplifié) ======
 DEPT_TO_REGION = {
     "01":"Auvergne-Rhône-Alpes","03":"Auvergne-Rhône-Alpes","07":"Auvergne-Rhône-Alpes","15":"Auvergne-Rhône-Alpes",
     "26":"Auvergne-Rhône-Alpes","38":"Auvergne-Rhône-Alpes","42":"Auvergne-Rhône-Alpes","43":"Auvergne-Rhône-Alpes",
@@ -33,14 +37,14 @@ DEPT_TO_REGION = {
 }
 REGIONS = sorted(set(DEPT_TO_REGION.values()) | {"DROM"})
 
-# --- État filtres par utilisateur ---
+# ====== État des filtres par utilisateur ======
 user_filters: Dict[int, Dict[str, Any]] = {}
 def get_user_filters(uid: int):
     if uid not in user_filters:
         user_filters[uid] = {"age_min": None, "age_max": None, "regions": set()}
     return user_filters[uid]
 
-# --- Utilitaires ---
+# ====== Utilitaires ======
 def compute_age(dob_str: str) -> Optional[int]:
     if not dob_str: return None
     try:
@@ -117,9 +121,8 @@ def make_fiches_txt(records: List[Dict[str, Any]]) -> str:
         out.append("-"*60); out.append("")
     return "\n".join(out).strip()
 
-# --- Parsers (sans pandas) ---
+# ====== Parsers (sans pandas) ======
 def extract_from_csv_text(text: str) -> List[Dict[str, Any]]:
-    # auto ; ou ,
     first = (text.splitlines()+[""])[0]
     try:
         dialect = csv.Sniffer().sniff(first)
@@ -145,7 +148,7 @@ def extract_from_json_text(text: str) -> List[Dict[str, Any]]:
             return [normalize_record(data)]
     except json.JSONDecodeError:
         pass
-    # JSON Lines
+    # JSONL
     for line in text.splitlines():
         line = line.strip()
         if not line: continue
@@ -185,14 +188,34 @@ def detect_and_extract(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]
         pass
     return extract_from_kv_txt(text)
 
-# --- UI ---
+# ====== Import par URL (gros fichiers) ======
+MAX_REMOTE_BYTES = 300 * 1024 * 1024  # 300 Mo max
+
+def http_get_capped(url: str, max_bytes: int = MAX_REMOTE_BYTES, timeout=30) -> bytes:
+    with requests.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        total = 0
+        chunks = []
+        for chunk in r.iter_content(1024 * 1024):
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise RuntimeError("Fichier trop gros pour import par URL.")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+# ====== UI ======
 HELP = (
-    "📎 Envoie un fichier `.txt`, `.csv`, `.json`/`.jsonl` → je renvoie un TXT formaté **FICHE 1, FICHE 2…**.\n\n"
+    "📎 Envoie un fichier `.txt`, `.csv`, `.json`/`.jsonl` → je renvoie un TXT **FICHE 1, FICHE 2…**.\n\n"
     "🔎 *Filtres* :\n"
     "• Âge : `/setage 18 35`, `/clearage`\n"
     "• Région : `/addregion Occitanie`, `/delregion Occitanie`, `/clearregions`\n"
-    "• Voir : `/filters`\n"
+    "• Voir : `/filters`\n\n"
+    "🌐 *Gros fichier ?* Utilise :\n"
+    "`/importurl https://...` (Dropbox/Drive/WeTransfer — mets un lien direct).\n"
 )
+
 def cfg_table(f: Dict[str, Any]) -> str:
     amin = f["age_min"] if f["age_min"] is not None else "-"
     amax = f["age_max"] if f["age_max"] is not None else "-"
@@ -208,7 +231,7 @@ def cfg_table(f: Dict[str, Any]) -> str:
         "```\n"
     )
 
-# --- Commandes ---
+# ====== Commandes ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = get_user_filters(update.effective_user.id)
     await update.message.reply_text(cfg_table(f) + HELP, parse_mode="Markdown", disable_web_page_preview=True)
@@ -273,7 +296,38 @@ async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = get_user_filters(update.effective_user.id)
     await update.message.reply_text(cfg_table(f), parse_mode="Markdown")
 
-# --- Fichiers ---
+async def importurl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Utilisation : /importurl <lien http(s)>")
+        return
+    url = context.args[0]
+    try:
+        await update.message.reply_text("⏬ Téléchargement du fichier…")
+        data = http_get_capped(url)
+        fname = url.split("?")[0].split("/")[-1] or "remote.bin"
+        if fname.endswith(".gz"):
+            try:
+                data = gzip.decompress(data)
+                fname = fname[:-3]
+            except Exception:
+                pass
+
+        records = detect_and_extract(data, fname)
+        if not records:
+            await update.message.reply_text("❌ Aucune fiche trouvée dans ce fichier.")
+            return
+
+        f = get_user_filters(update.effective_user.id)
+        filtered = apply_filters(records, f) if (f["regions"] or f["age_min"] is not None or f["age_max"] is not None) else records
+
+        out_txt = make_fiches_txt(filtered)
+        out_name = re.sub(r"\.\w+$", "", fname) + "_fiches.txt"
+        bio = io.BytesIO(out_txt.encode("utf-8")); bio.name = out_name
+        await update.message.reply_document(bio, caption=f"✅ {len(filtered)} fiche(s) produite(s) depuis l’URL.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Échec du téléchargement/traitement : {e}")
+
+# ====== Fichiers envoyés directement dans Telegram ======
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:
@@ -299,12 +353,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Commande inconnue. Aide: /help")
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("⚠️ BOT_TOKEN manquant.")
-    app = Application.builder().token(BOT_TOKEN).build()
+# ====== Démarrage (supprime webhook pour éviter 'Conflict') ======
+async def _post_init(app: Application):
+    await app.bot.delete_webhook(drop_pending_updates=True)
 
-    # IMPORTANT: commandes d’abord
+def register_handlers(app: Application):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("setage", setage))
@@ -313,13 +366,17 @@ def main():
     app.add_handler(CommandHandler("delregion", delregion))
     app.add_handler(CommandHandler("clearregions", clearregions))
     app.add_handler(CommandHandler("filters", filters_cmd))
-
-    # puis les messages/fichiers
+    app.add_handler(CommandHandler("importurl", importurl))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
+async def main_async():
+    if not BOT_TOKEN:
+        raise RuntimeError("⚠️ BOT_TOKEN manquant.")
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
+    register_handlers(app)
     print("Bot started ✅")
-    app.run_polling()
+    await app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
