@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-import os, io, re, json, csv, gzip, asyncio
+import os, io, re, json, csv, gzip, tempfile, shutil
 from datetime import date
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Iterable
 
 import requests
+import ijson
 from dateutil import parser as dateparser
 from telegram import Update
 from telegram.ext import (
@@ -13,7 +14,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ====== Départements -> Régions (métropole + DROM simplifié) ======
+# ===== Départements -> Régions =====
 DEPT_TO_REGION = {
     "01":"Auvergne-Rhône-Alpes","03":"Auvergne-Rhône-Alpes","07":"Auvergne-Rhône-Alpes","15":"Auvergne-Rhône-Alpes",
     "26":"Auvergne-Rhône-Alpes","38":"Auvergne-Rhône-Alpes","42":"Auvergne-Rhône-Alpes","43":"Auvergne-Rhône-Alpes",
@@ -27,7 +28,8 @@ DEPT_TO_REGION = {
     "75":"Île-de-France","77":"Île-de-France","78":"Île-de-France","91":"Île-de-France","92":"Île-de-France","93":"Île-de-France","94":"Île-de-France","95":"Île-de-France",
     "14":"Normandie","27":"Normandie","50":"Normandie","61":"Normandie","76":"Normandie",
     "16":"Nouvelle-Aquitaine","17":"Nouvelle-Aquitaine","19":"Nouvelle-Aquitaine","23":"Nouvelle-Aquitaine","24":"Nouvelle-Aquitaine",
-    "33":"Nouvelle-Aquitaine","40":"Nouvelle-Aquitaine","47":"Nouvelle-Aquitaine","64":"Nouvelle-Aquitaine","79":"Nouvelle-Aquitaine","86":"Nouvelle-Aquitaine","87":"Nouvelle-Aquitaine",
+    "33":"Nouvelle-Aquitaine","40":"Nouvelle-Aquitaine","47":"Nouvelle-Aquitaine","64":"Nouvelle-Aquitaine",
+    "79":"Nouvelle-Aquitaine","86":"Nouvelle-Aquitaine","87":"Nouvelle-Aquitaine",
     "09":"Occitanie","11":"Occitanie","12":"Occitanie","30":"Occitanie","31":"Occitanie","32":"Occitanie","34":"Occitanie",
     "46":"Occitanie","48":"Occitanie","65":"Occitanie","66":"Occitanie","81":"Occitanie","82":"Occitanie",
     "44":"Pays de la Loire","49":"Pays de la Loire","53":"Pays de la Loire","72":"Pays de la Loire","85":"Pays de la Loire",
@@ -37,14 +39,14 @@ DEPT_TO_REGION = {
 }
 REGIONS = sorted(set(DEPT_TO_REGION.values()) | {"DROM"})
 
-# ====== État des filtres par utilisateur ======
+# ===== État filtres =====
 user_filters: Dict[int, Dict[str, Any]] = {}
 def get_user_filters(uid: int):
     if uid not in user_filters:
         user_filters[uid] = {"age_min": None, "age_max": None, "regions": set()}
     return user_filters[uid]
 
-# ====== Utilitaires ======
+# ===== Utilitaires =====
 def compute_age(dob_str: str) -> Optional[int]:
     if not dob_str: return None
     try:
@@ -66,7 +68,7 @@ def cp_to_region(cp: str) -> Optional[str]:
 
 def normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     out = {k.strip(): ("" if v is None else str(v).strip()) for k, v in rec.items()}
-    aliases = {
+    alias = {
         "civilité":"Civilité","civilite":"Civilité",
         "prenom":"Prénom","prénom":"Prénom","first_name":"Prénom","given_name":"Prénom",
         "nom":"Nom","last_name":"Nom","family_name":"Nom",
@@ -82,86 +84,106 @@ def normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     }
     remapped = {}
     for k, v in out.items():
-        key = aliases.get(k.lower(), k)
-        remapped[key] = v
+        remapped[alias.get(k.lower(), k)] = v
     if not remapped.get("Région"):
         cp = remapped.get("Code Postal", "")
         reg = cp_to_region(re.sub(r"\D", "", cp)) if cp else None
         if reg: remapped["Région"] = reg
-    for k in ("Date de naissance", "date_naissance", "dob"):
-        if remapped.get(k):
-            a = compute_age(remapped[k])
-            if a is not None:
-                remapped["_age"] = a
-                break
+    for key in ("Date de naissance","date_naissance","dob"):
+        if remapped.get(key):
+            a = compute_age(remapped[key]); 
+            if a is not None: remapped["_age"] = a; break
     return remapped
 
-def apply_filters(records: List[Dict[str, Any]], f: Dict[str, Any]) -> List[Dict[str, Any]]:
+def record_passes(rec: Dict[str, Any], f: Dict[str, Any]) -> bool:
     mn, mx = f.get("age_min"), f.get("age_max")
     rset = {r.lower() for r in f.get("regions", set())}
-    def ok(r: Dict[str, Any]) -> bool:
-        if mn is not None or mx is not None:
-            a = r.get("_age")
-            if a is None or (mn is not None and a < mn) or (mx is not None and a > mx):
-                return False
-        if rset:
-            reg = r.get("Région", "")
-            if reg.lower() not in rset: return False
-        return True
-    return [x for x in records if ok(x)]
+    if mn is not None or mx is not None:
+        a = rec.get("_age")
+        if a is None or (mn is not None and a < mn) or (mx is not None and a > mx):
+            return False
+    if rset:
+        reg = rec.get("Région", "")
+        if reg.lower() not in rset: return False
+    return True
 
-def make_fiches_txt(records: List[Dict[str, Any]]) -> str:
-    if not records: return "Aucune fiche après filtrage."
-    order = ["Civilité","Prénom","Nom","Date de naissance","Email","Mobile","Téléphone Fixe",
-             "Adresse","Ville","Code Postal","Région","IBAN","BIC"]
-    out = []
-    for i, rec in enumerate(records, 1):
-        out.append(f"FICHE {i}"); out.append("-"*60)
-        for k in order: out.append(f"{k}: {rec.get(k,'')}")
-        out.append("-"*60); out.append("")
-    return "\n".join(out).strip()
+# ===== Fiches =====
+FIELDS_ORDER = ["Civilité","Prénom","Nom","Date de naissance","Email","Mobile","Téléphone Fixe",
+                "Adresse","Ville","Code Postal","Région","IBAN","BIC"]
 
-# ====== Parsers (sans pandas) ======
-def extract_from_csv_text(text: str) -> List[Dict[str, Any]]:
-    first = (text.splitlines()+[""])[0]
+def write_fiche(fp, idx: int, rec: Dict[str, Any]) -> int:
+    buf = [f"FICHE {idx}", "-"*60]
+    for k in FIELDS_ORDER: buf.append(f"{k}: {rec.get(k,'')}")
+    buf += ["-"*60, ""]
+    s = "\n".join(buf)
+    fp.write(s)
+    return len(s.encode("utf-8"))
+
+# ===== Parsers streaming =====
+def stream_csv(fb) -> Iterable[Dict[str, Any]]:
+    # fb: binary file-like
+    # détecte séparateur sur la première ligne texte
+    first_line = fb.readline()
     try:
-        dialect = csv.Sniffer().sniff(first)
+        header = first_line.decode("utf-8", errors="ignore")
     except Exception:
-        dialect = csv.excel
-    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-    out = []
+        header = first_line.decode("latin-1", errors="ignore")
+    sep = ";" if header.count(";") >= header.count(",") else ","
+    # recompose un flux texte (première ligne + le reste)
+    rest = io.TextIOWrapper(fb, encoding="utf-8", errors="ignore")
+    reader = csv.DictReader(io.StringIO(header + rest.read()), delimiter=sep)
     for row in reader:
         clean = {k: v for k, v in row.items() if v is not None and str(v).strip() != ""}
-        if clean: out.append(normalize_record(clean))
-    return out
+        if clean: yield normalize_record(clean)
 
-def extract_from_json_text(text: str) -> List[Dict[str, Any]]:
-    text = text.strip()
-    recs: List[Dict[str, Any]] = []
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict): recs.append(normalize_record(item))
-            return recs
-        if isinstance(data, dict):
-            return [normalize_record(data)]
-    except json.JSONDecodeError:
-        pass
-    # JSONL
-    for line in text.splitlines():
-        line = line.strip()
-        if not line: continue
+def stream_jsonl(fb) -> Iterable[Dict[str, Any]]:
+    for raw in fb:
         try:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line: continue
             obj = json.loads(line)
-            if isinstance(obj, dict): recs.append(normalize_record(obj))
-        except json.JSONDecodeError:
+            if isinstance(obj, dict):
+                yield normalize_record(obj)
+        except Exception:
             continue
-    return recs
 
-def extract_from_kv_txt(text: str) -> List[Dict[str, Any]]:
+def stream_json_array(fb) -> Iterable[Dict[str, Any]]:
+    # ijson lit élément par élément d’un grand tableau JSON
+    for obj in ijson.items(fb, "item"):
+        if isinstance(obj, dict):
+            yield normalize_record(obj)
+
+def detect_and_stream(path: str, filename: str) -> Iterable[Dict[str, Any]]:
+    name = (filename or "").lower()
+    opener = open
+    if name.endswith(".gz"):
+        opener = lambda p, mode="rb": gzip.open(p, mode)
+
+    if name.endswith(".csv") or name.endswith(".csv.gz"):
+        with opener(path, "rb") as fb:
+            for rec in stream_csv(fb): yield rec
+        return
+
+    if name.endswith(".jsonl") or name.endswith(".jsonl.gz"):
+        with opener(path, "rb") as fb:
+            for rec in stream_jsonl(fb): yield rec
+        return
+
+    if name.endswith(".json") or name.endswith(".json.gz"):
+        with opener(path, "rb") as fb:
+            # on essaie d'abord JSON Lines (au cas où), sinon tableau JSON
+            pos = fb.tell()
+            for rec in stream_jsonl(fb): yield rec
+            if fb.tell() != pos:  # on a lu quelque chose -> on revient
+                return
+        with opener(path, "rb") as fb2:
+            for rec in stream_json_array(fb2): yield rec
+        return
+
+    # fallback: essayer .txt key:value
+    with opener(path, "rb") as fb:
+        text = fb.read().decode("utf-8", errors="ignore")
     blocks = re.split(r"(?:\n\s*(?:[-=]{3,}|FICHE\s+\d+)\s*\n)|\n{2,}", text, flags=re.IGNORECASE)
-    out = []
     for block in blocks:
         block = block.strip()
         if not block: continue
@@ -169,51 +191,39 @@ def extract_from_kv_txt(text: str) -> List[Dict[str, Any]]:
         for line in block.splitlines():
             m = re.match(r"\s*([^:|]+)\s*[:|]\s*(.+)\s*$", line)
             if m: rec[m.group(1).strip()] = m.group(2).strip()
-        if rec: out.append(normalize_record(rec))
-    return out
+        if rec: yield normalize_record(rec)
 
-def detect_and_extract(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
-    name = (filename or "").lower()
-    text = file_bytes.decode("utf-8", errors="ignore")
-    if name.endswith(".csv"):
-        return extract_from_csv_text(text)
-    if name.endswith(".json") or name.endswith(".jsonl"):
-        r = extract_from_json_text(text)
-        if r: return r
-    r = extract_from_json_text(text)
-    if r: return r
-    try:
-        return extract_from_csv_text(text)
-    except Exception:
-        pass
-    return extract_from_kv_txt(text)
+# ===== Téléchargement gros fichiers =====
+MAX_DOWNLOAD = 5 * 1024 * 1024 * 1024  # 5 Go cap de sécurité
+CHUNK = 4 * 1024 * 1024                # 4 Mo
+PART_LIMIT = 45 * 1024 * 1024          # ~45 Mo par fichier de sortie (Telegram-friendly)
 
-# ====== Import par URL (gros fichiers) ======
-MAX_REMOTE_BYTES = 300 * 1024 * 1024  # 300 Mo max
-
-def http_get_capped(url: str, max_bytes: int = MAX_REMOTE_BYTES, timeout=30) -> bytes:
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        total = 0
-        chunks = []
-        for chunk in r.iter_content(1024 * 1024):
-            if not chunk:
-                break
+def download_to_temp(url: str) -> (str, str):
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+    # devine un nom
+    name = url.split("?")[0].split("/")[-1] or "remote.bin"
+    fd, path = tempfile.mkstemp(prefix="dl_", suffix="_" + name)
+    total = 0
+    with os.fdopen(fd, "wb") as f:
+        for chunk in r.iter_content(CHUNK):
+            if not chunk: continue
             total += len(chunk)
-            if total > max_bytes:
-                raise RuntimeError("Fichier trop gros pour import par URL.")
-            chunks.append(chunk)
-        return b"".join(chunks)
+            if total > MAX_DOWNLOAD:
+                f.close()
+                os.remove(path)
+                raise RuntimeError("Fichier trop volumineux (cap de sécurité 5 Go).")
+            f.write(chunk)
+    return path, name
 
-# ====== UI ======
+# ===== UI & commandes =====
 HELP = (
-    "📎 Envoie un fichier `.txt`, `.csv`, `.json`/`.jsonl` → je renvoie un TXT **FICHE 1, FICHE 2…**.\n\n"
-    "🔎 *Filtres* :\n"
+    "📎 Envoie un fichier `.txt`, `.csv`, `.json/.jsonl` → je renvoie un TXT **FICHE 1, FICHE 2…**.\n\n"
+    "🔎 *Filtres*\n"
     "• Âge : `/setage 18 35`, `/clearage`\n"
     "• Région : `/addregion Occitanie`, `/delregion Occitanie`, `/clearregions`\n"
     "• Voir : `/filters`\n\n"
-    "🌐 *Gros fichier ?* Utilise :\n"
-    "`/importurl https://...` (Dropbox/Drive/WeTransfer — mets un lien direct).\n"
+    "🌐 *Gros fichiers (>1 Go)* : utilise `/importurl <lien>` (Dropbox/Drive/WeTransfer)."
 )
 
 def cfg_table(f: Dict[str, Any]) -> str:
@@ -231,7 +241,6 @@ def cfg_table(f: Dict[str, Any]) -> str:
         "```\n"
     )
 
-# ====== Commandes ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = get_user_filters(update.effective_user.id)
     await update.message.reply_text(cfg_table(f) + HELP, parse_mode="Markdown", disable_web_page_preview=True)
@@ -296,64 +305,111 @@ async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = get_user_filters(update.effective_user.id)
     await update.message.reply_text(cfg_table(f), parse_mode="Markdown")
 
+# ===== Traitement générique (stream -> txt en parties) =====
+def process_stream_to_parts(stream: Iterable[Dict[str, Any]], f: Dict[str, Any], base_name: str) -> List[str]:
+    """Retourne la liste des chemins des fichiers TXT générés (part-1, part-2, …)."""
+    parts = []
+    idx = 0
+    part_idx = 1
+    cur_size = 0
+    tmpdir = tempfile.mkdtemp(prefix="fiches_")
+    out_path = os.path.join(tmpdir, f"{base_name}_fiches_part{part_idx}.txt")
+    fp = open(out_path, "w", encoding="utf-8", newline="\n")
+    parts.append(out_path)
+
+    try:
+        for rec in stream:
+            if not record_passes(rec, f): 
+                continue
+            idx += 1
+            written = write_fiche(fp, idx, rec)
+            cur_size += written
+            if cur_size >= PART_LIMIT:
+                fp.close()
+                part_idx += 1
+                cur_size = 0
+                out_path = os.path.join(tmpdir, f"{base_name}_fiches_part{part_idx}.txt")
+                fp = open(out_path, "w", encoding="utf-8", newline="\n")
+                parts.append(out_path)
+    finally:
+        fp.close()
+    # supprime les fichiers vides en queue
+    cleaned = []
+    for p in parts:
+        if os.path.getsize(p) > 0:
+            cleaned.append(p)
+        else:
+            try: os.remove(p)
+            except Exception: pass
+    return cleaned
+
+# ===== Commande import par URL =====
 async def importurl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Utilisation : /importurl <lien http(s)>")
+        await update.message.reply_text("Utilisation : /importurl <lien http(s) direct>")
         return
     url = context.args[0]
     try:
-        await update.message.reply_text("⏬ Téléchargement du fichier…")
-        data = http_get_capped(url)
-        fname = url.split("?")[0].split("/")[-1] or "remote.bin"
-        if fname.endswith(".gz"):
-            try:
-                data = gzip.decompress(data)
-                fname = fname[:-3]
-            except Exception:
-                pass
+        await update.message.reply_text("⏬ Téléchargement en cours (streaming)…")
+        path, name = download_to_temp(url)
+        base = re.sub(r"\.([A-Za-z0-9]+)(\.gz)?$", "", name)
+        f = get_user_filters(update.effective_user.id)
 
-        records = detect_and_extract(data, fname)
-        if not records:
-            await update.message.reply_text("❌ Aucune fiche trouvée dans ce fichier.")
+        await update.message.reply_text("🔧 Traitement… (je te renvoie des fichiers en plusieurs parties si besoin)")
+        parts = process_stream_to_parts(detect_and_stream(path, name), f, base)
+
+        if not parts:
+            await update.message.reply_text("❌ Aucune fiche après filtrage.")
             return
 
-        f = get_user_filters(update.effective_user.id)
-        filtered = apply_filters(records, f) if (f["regions"] or f["age_min"] is not None or f["age_max"] is not None) else records
-
-        out_txt = make_fiches_txt(filtered)
-        out_name = re.sub(r"\.\w+$", "", fname) + "_fiches.txt"
-        bio = io.BytesIO(out_txt.encode("utf-8")); bio.name = out_name
-        await update.message.reply_document(bio, caption=f"✅ {len(filtered)} fiche(s) produite(s) depuis l’URL.")
+        for p in parts:
+            with open(p, "rb") as rd:
+                await update.message.reply_document(rd, caption=f"✅ {os.path.basename(p)}")
     except Exception as e:
-        await update.message.reply_text(f"❌ Échec du téléchargement/traitement : {e}")
+        await update.message.reply_text(f"❌ Échec : {e}")
+    finally:
+        # nettoyage
+        try:
+            if 'path' in locals() and os.path.exists(path): os.remove(path)
+        except Exception:
+            pass
 
-# ====== Fichiers envoyés directement dans Telegram ======
+# ===== Fichiers envoyés directement au bot (petits/moyens) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:
         await update.message.reply_text("Envoie un fichier .txt / .csv / .json 😉")
         return
+    # Telegram limite l’upload direct des bots => si trop gros, conseiller /importurl
+    if doc.file_size and doc.file_size > 45 * 1024 * 1024:
+        await update.message.reply_text("⚠️ Fichier trop volumineux pour l’upload direct. Utilise `/importurl <lien>`.")
+        return
+
     tgfile = await doc.get_file()
     data = await tgfile.download_as_bytes()
     fname = doc.file_name or "input.txt"
-
-    records = detect_and_extract(data, fname)
-    if not records:
-        await update.message.reply_text("❌ Aucune fiche trouvée dans ce fichier.")
-        return
-
+    base = re.sub(r"\.([A-Za-z0-9]+)(\.gz)?$", "", fname)
     f = get_user_filters(update.effective_user.id)
-    filtered = apply_filters(records, f) if (f["regions"] or f["age_min"] is not None or f["age_max"] is not None) else records
 
-    out_txt = make_fiches_txt(filtered)
-    out_name = re.sub(r"\.\w+$", "", fname) + "_fiches.txt"
-    bio = io.BytesIO(out_txt.encode("utf-8")); bio.name = out_name
-    await update.message.reply_document(bio, caption=f"✅ {len(filtered)} fiche(s) produite(s).")
+    # on met en flux mémoire -> fichier(s) de sortie (petits volumes)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{fname}")
+    try:
+        tmp.write(data); tmp.close()
+        parts = process_stream_to_parts(detect_and_stream(tmp.name, fname), f, base)
+        if not parts:
+            await update.message.reply_text("❌ Aucune fiche trouvée après filtrage.")
+            return
+        for p in parts:
+            with open(p, "rb") as rd:
+                await update.message.reply_document(rd, caption=f"✅ {os.path.basename(p)}")
+    finally:
+        try: os.remove(tmp.name)
+        except Exception: pass
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Commande inconnue. Aide: /help")
 
-# ====== Démarrage (supprime webhook pour éviter 'Conflict') ======
+# ===== Démarrage propre (supprime webhook, pas d’asyncio.run) =====
 async def _post_init(app: Application):
     await app.bot.delete_webhook(drop_pending_updates=True)
 
@@ -370,13 +426,13 @@ def register_handlers(app: Application):
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-async def main_async():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("⚠️ BOT_TOKEN manquant.")
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
     register_handlers(app)
     print("Bot started ✅")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    main()
