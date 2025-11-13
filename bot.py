@@ -1,77 +1,70 @@
-# bot.py (version DEMO pour tests, données fictives)
-# Utilisation pédagogique : remplace dans ton repo pour tester le comportement.
-# NE PAS y mettre de vraies données personnelles dans le code.
 
 import os
-import csv
 import re
+import csv
 import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-import phonenumbers
 from dotenv import load_dotenv
+import phonenumbers
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ---------- Configuration ----------
+# ---------------- Configuration ----------------
 CSV_PATH_DEFAULT = "./data.csv"
 FR_REGION = "FR"
 CLEAN_RE = re.compile(r"[^0-9+]")
 KV_RE = re.compile(r"^\s*([^:]+)\s*:\s*(.*)$")  # pour parser "Clé : Valeur"
 
-# ---------- Normalisation ----------
+# ---------------- Normalisation ----------------
 def normalize_fr(raw: str) -> Optional[str]:
-    """Normalise un numéro FR en version nationale 0XXXXXXXXX (essaie plusieurs variantes)."""
+    """Normalise un numéro FR pour qu’il devienne 0XXXXXXXXX (ou None si invalide)."""
     if not raw:
         return None
     s = CLEAN_RE.sub("", raw).strip()
     if not s:
         return None
+
+    # 0033 -> +33
     if s.startswith("0033"):
         s = "+" + s[2:]
 
-    attempts = [s]
-    if s.startswith("33") and not s.startswith("+"):
-        attempts.append("+" + s)
-    if len(s) == 9 and s[0] in "679":
-        attempts.append("0" + s)
-        attempts.append("+33" + s)
-    if len(s) == 10 and not s.startswith("0"):
-        attempts.append("0" + s)
+    # convertir +33... ou 33... en 0...
+    if s.startswith("+33"):
+        s = "0" + s[3:]
+    elif s.startswith("33"):
+        s = "0" + s[2:]
+    # si déjà 0XXXXXXXXX et bonne longueur -> ok
+    elif s.startswith("0") and len(s) == 10:
+        pass
+    # si 9 chiffres (sans 0) -> ajoute 0 si commence par 6/7/9
+    elif len(s) == 9 and s[0] in "679":
+        s = "0" + s
+    # si plus long -> garder les 10 derniers chiffres
+    if len(s) > 10:
+        s = s[-10:]
 
-    seen = set()
-    attempts = [a for a in attempts if a and (a not in seen and not seen.add(a))]
+    # vérifie forme finale
+    if len(s) != 10 or not s.startswith("0"):
+        return None
+    return s
 
-    for a in attempts:
-        try:
-            num = phonenumbers.parse(a, None if a.startswith("+") else FR_REGION)
-            if not phonenumbers.is_valid_number(num):
-                continue
-            national = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.NATIONAL)
-            national = CLEAN_RE.sub("", national)
-            if national and not national.startswith("0") and num.country_code == 33:
-                national = "0" + national
-            return national
-        except Exception:
-            continue
-    return None
-
-# ---------- Chargement / indexation ----------
+# ---------------- Chargement / indexation ----------------
 def load_index(csv_path: str) -> Tuple[Dict[str, List[Dict[str, str]]], int, int, List[Dict[str, str]]]:
     """
     Charge le CSV indiqué et renvoie :
-    - index par numéro normalisé -> [rows]
-    - total lignes lues
-    - indexed (lignes contenant au moins un numéro)
-    - all_rows list of dicts
+      - idx: dict numéro_normalisé -> [rows]
+      - total: total lignes lues
+      - indexed: lignes contenant au moins un numéro
+      - all_rows: toutes les lignes lues (list of dict)
     """
     idx: Dict[str, List[Dict[str, str]]] = {}
     total = 0
@@ -88,8 +81,9 @@ def load_index(csv_path: str) -> Tuple[Dict[str, List[Dict[str, str]]], int, int
             total += 1
 
             nums = []
+            # noms de colonnes courants à vérifier
             for key in ["Mobile","mobile","Telephone","telephone","Tel","Phone","Portable","Numero","Numéro",
-                        "telephone_mobile","mobile_phone","gsm"]:
+                        "telephone_mobile","mobile_phone","gsm","telephone_fix","Telephone Fixe","Téléphone Fixe"]:
                 if key in row and row[key]:
                     n = normalize_fr(row[key])
                     if n:
@@ -99,9 +93,11 @@ def load_index(csv_path: str) -> Tuple[Dict[str, List[Dict[str, str]]], int, int
             indexed += 1
             for n in nums:
                 idx.setdefault(n, []).append(row)
+    # debug minimal: print exemples
+    print(f"[INFO] load_index: {indexed} fiches indexées / {total} lignes (source={csv_path}).")
     return idx, total, indexed, all_rows
 
-# ---------- Format affichage ----------
+# ---------------- Format affichage ----------------
 def format_card(d: Dict[str, str]) -> str:
     order = ["Prenom","Nom","Email","Mobile","Telephone","Ville","Adresse"]
     lines = []
@@ -114,7 +110,7 @@ def format_card(d: Dict[str, str]) -> str:
             lines.append(f"{k}: {v.strip()}")
     return "\n".join(lines) if lines else "(aucune info)"
 
-# ---------- App bot ----------
+# ---------------- Bot application ----------------
 class App:
     def __init__(self, token: str, csv_path: str):
         self.token = token
@@ -126,43 +122,51 @@ class App:
 
     def start(self):
         app = ApplicationBuilder().token(self.token).build()
+        # charge index au démarrage
         self.index, self.total, self.indexed, self.all_rows = load_index(self.csv_path)
-        print(f"[DEMO] CSV chargé: {self.indexed} fiches indexées / {self.total} lignes (source: {self.csv_path}).")
+        print(f"[BOT] Démarrage: {self.indexed} fiches indexées / {self.total} lignes.")
 
         # handlers
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
+        app.add_handler(CommandHandler("reload", self.cmd_reload))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
         app.add_handler(CommandHandler("export", self.cmd_export))
         app.add_handler(CommandHandler("num", self.cmd_num))
         app.add_handler(CommandHandler("load", self.cmd_load))
-        app.add_handler(CommandHandler("sample", self.cmd_sample))  # génère des données factices
+        app.add_handler(CommandHandler("sample", self.cmd_sample))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_document))
 
-        print("[DEMO] Bot démarré. Polling...")
+        print("[BOT] Bot prêt. Lancement du polling...")
         app.run_polling()
 
     # ----- commandes -----
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🤖 Bot DEMO — Envoie-moi un fichier texte structuré (Clé : Valeur) ou use /sample pour créer des fiches factices.\n"
-            "Commandes : /help /sample /load /stats /export /num <num>"
+            "Bonjour — bot DE TEST.\n"
+            "Envoie un fichier .txt structuré (Clé : Valeur) puis /load pour le traiter.\n"
+            "Commandes: /help /sample /load /reload /stats /export /num <num>"
         )
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "Utilisation (DEMO):\n"
-            "• Envoie un fichier .txt structuré (Clé : Valeur) puis /load\n"
-            "• /sample → crée 2 fiches factices pour tester\n"
-            "• /num <numéro> → recherche par numéro (ex: /num 0611223344)\n"
-            "• /stats → affiche nombre de fiches indexées\n"
+            "Utilisation :\n"
+            "• Envoyer un fichier .txt structuré (Clé : Valeur) puis /load\n"
+            "• /sample → crée 2 fiches factices\n"
+            "• /num <num> → recherche un numéro (ex: /num 0611223344)\n"
+            "• /reload → recharge le CSV\n"
+            "• /stats → affiche nombre indexé\n"
             "• /export → exporte toutes les fiches en .txt\n"
         )
 
+    async def cmd_reload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.index, self.total, self.indexed, self.all_rows = load_index(self.csv_path)
+        await update.message.reply_text(f"CSV rechargé: {self.indexed} fiches indexées / {self.total} lignes.")
+
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"Fiches indexées: {self.indexed} / {self.total} lignes (source: {self.csv_path}).")
+        await update.message.reply_text(f"Fiches indexées: {self.indexed} / {self.total} lignes.")
 
     async def cmd_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.all_rows:
@@ -173,13 +177,13 @@ class App:
             parts.append(f"Fiche {i}\n----------------\n{format_card(row)}")
         content = "\n\n".join(parts)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"demo_export_{stamp}.txt"
+        fname = f"export_{stamp}.txt"
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".txt") as tf:
             tf.write(content)
             tmp_path = tf.name
         try:
             with open(tmp_path, "rb") as f:
-                await update.message.reply_document(document=f, filename=fname, caption="Export DEMO")
+                await update.message.reply_document(document=f, filename=fname, caption="Export des fiches")
         finally:
             try:
                 os.remove(tmp_path)
@@ -194,14 +198,14 @@ class App:
             return
         await self._reply_with_results(update, query)
 
-    # ----- réception texte -----
+    # ----- reception texte (message libre) -----
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = (update.message.text or "").strip()
         queries = [t for t in re.split(r"[\n,;]", txt) if t.strip()]
         for q in queries:
             await self._reply_with_results(update, q)
 
-    # ----- réception fichier -----
+    # ----- reception fichier -----
     async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc = update.message.document
         if not doc:
@@ -230,17 +234,17 @@ class App:
 
         await update.message.reply_text(f"Fichier reçu: {doc.file_name}\nEnregistré. Envoie /load pour le traiter.")
 
-    # ----- /load -----
+    # ----- /load : conversion et ajout au CSV -----
     async def cmd_load(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         key = f"uploads_{chat_id}"
         uploads = context.application.bot_data.get(key, [])
 
         if not uploads:
-            await update.message.reply_text("Aucun fichier à charger. Envoie d'abord un fichier.")
+            await update.message.reply_text("Aucun fichier à charger. Envoie d'abord un fichier au bot.")
             return
 
-        # assure data.csv existe
+        # s'assurer que data.csv existe
         if not os.path.exists(self.csv_path):
             with open(self.csv_path, "w", encoding="utf-8") as f:
                 f.write("")
@@ -252,7 +256,7 @@ class App:
             name = os.path.basename(up).lower()
             try:
                 if name.endswith(".csv"):
-                    # on ajoute simplement le csv (ligne par ligne)
+                    # ajoute simplement le csv (ligne par ligne)
                     with open(up, "r", encoding="utf-8", errors="replace") as fsrc, \
                          open(self.csv_path, "a", encoding="utf-8") as fdst:
                         for line in fsrc:
@@ -267,6 +271,7 @@ class App:
                         line = raw.strip()
                         if not line:
                             continue
+                        # séparation par ligne de tirets
                         if line.startswith("-") and len(line) > 5:
                             if current:
                                 all_new_rows.append(current)
@@ -284,13 +289,12 @@ class App:
             except Exception as e:
                 await update.message.reply_text(f"Erreur lecture {os.path.basename(up)} : {e}")
 
-        # vider uploads
+        # vider la liste d'uploads pour ce chat
         context.application.bot_data[key] = []
 
-        # écrire les nouvelles lignes dans data.csv
+        # écrire all_new_rows dans data.csv
         if all_new_rows:
             cols = sorted(columns)
-            # si data.csv a header existant ? (simple check)
             had_header = False
             try:
                 with open(self.csv_path, "r", encoding="utf-8") as f:
@@ -306,7 +310,6 @@ class App:
                     writer.writeheader()
                     writer.writerows(all_new_rows)
             else:
-                # append rows (may mis-align columns if headers diffèrent; demo seulement)
                 with open(self.csv_path, "a", newline="", encoding="utf-8") as out:
                     writer = csv.DictWriter(out, fieldnames=cols)
                     writer.writerows(all_new_rows)
@@ -315,23 +318,21 @@ class App:
         self.index, self.total, self.indexed, self.all_rows = load_index(self.csv_path)
         await update.message.reply_text(f"✅ {len(all_new_rows)} fiches converties et ajoutées. Total: {self.total}")
 
-    # ----- commande sample (crée données fictives) -----
+    # ----- sample : écrit 2 fiches factices pour tester -----
     async def cmd_sample(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         sample_rows = [
             {"Prenom": "Jean", "Nom": "Dupont", "Mobile": "0611223344", "Ville": "Paris"},
             {"Prenom": "Paul", "Nom": "Martin", "Mobile": "+33 6 11 22 33 44", "Ville": "Lyon"},
         ]
-        # écrire sample dans data.csv (écrase pour la demo)
         cols = sorted({k for r in sample_rows for k in r.keys()})
         with open(self.csv_path, "w", newline="", encoding="utf-8") as out:
             writer = csv.DictWriter(out, fieldnames=cols)
             writer.writeheader()
             writer.writerows(sample_rows)
-
         self.index, self.total, self.indexed, self.all_rows = load_index(self.csv_path)
         await update.message.reply_text(f"✅ Sample créé: {len(sample_rows)} fiches. Teste /num 0611223344")
 
-    # ----- recherche -----
+    # ----- recherche et réponse -----
     async def _reply_with_results(self, update: Update, q: str):
         normalized = normalize_fr(q)
         results: List[Dict[str, str]] = []
@@ -365,15 +366,13 @@ class App:
                 parts.append(f"Fiche {i}\n----------------\n{format_card(r)}")
             await update.message.reply_text("\n\n".join(parts))
 
-# ---------- Entrée ----------
+# ---------------- Entrée ----------------
 def main():
-    load_dotenv()  # charge .env local si présent
+    load_dotenv()
     token = os.getenv("BOT_TOKEN", "").strip()
     csv_path = os.getenv("CSV_PATH", CSV_PATH_DEFAULT)
     if not token:
-        print("ERREUR: BOT_TOKEN non défini. Définis la variable d'environnement BOT_TOKEN avant de lancer.")
-        return
-    # create empty csv if missing (demo)
+        raise SystemExit("Erreur: définis la variable d'environnement BOT_TOKEN avant de lancer.")
     if not os.path.exists(csv_path):
         with open(csv_path, "w", encoding="utf-8") as f:
             f.write("")
