@@ -1,0 +1,3 @@
+Civilite,Prenom,Nom,Date de naissance,Email,Mobile,Telephone Fixe,Code Postal,Ville,Adresse,IBAN,BIC
+M,Jean,Durand,1985-02-20,jean@example.com,0612345678,0140203040,75001,Paris,10 Rue Exemple,FR761234567890,AGRIFRPP
+Mme,Marie,Martin,1990-11-05,marie@example.com,+33 6 98 76 54 32,01 55 44 33 22,13008,Marseille,25 Avenue Exemple,FR141234567890,BNPAFRPP
