@@ -1,3 +1,4 @@
+# bot.py
 import csv
 import os
 import re
@@ -48,6 +49,8 @@ def load_index(csv_path: str) -> Tuple[Dict[str, List[Dict[str, str]]], int, int
     total = 0
     indexed = 0
     all_rows: List[Dict[str, str]] = []
+    if not os.path.exists(csv_path):
+        return idx, total, indexed, all_rows
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -99,8 +102,12 @@ class App:
         app.add_handler(CommandHandler("reload", self.cmd_reload))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
         app.add_handler(CommandHandler("export", self.cmd_export))
-        app.add_handler(CommandHandler("num", self.cmd_num))          # 👈 NOUVEAU
+        app.add_handler(CommandHandler("num", self.cmd_num))          # recherche directe
+        app.add_handler(CommandHandler("load", self.cmd_load))       # charge les fichiers uploadés
+
+        # Handlers
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+        app.add_handler(MessageHandler(filters.Document.ALL, self.on_document))
 
         print("Bot démarré. Laissez cette fenêtre ouverte. Ctrl+C pour arrêter.")
         app.run_polling()
@@ -108,19 +115,21 @@ class App:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Bonjour ! Envoie-moi un numéro (ex: 06 12 34 56 78).\n"
-            "Commandes: /help /reload /stats /export /num <numéro>"
+            "Tu peux aussi m'envoyer des fichiers (.csv/.txt) puis envoyer /load pour les ajouter au data.csv.\n"
+            "Commandes: /help /reload /stats /export /num <numéro> /load"
         )
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "<b>Utilisation</b> :\n"
-            "• Numéro exact (06..., +33 6..., 0033...)\n"
-            "• Ou 4 derniers chiffres\n\n"
+            "• Envoie un numéro (06..., +33...)\n"
+            "• Ou envoie les 4 derniers chiffres\n\n"
             "<b>Commandes</b> :\n"
             "• /reload → recharge le CSV\n"
             "• /stats → nombre de fiches indexées\n"
             "• /export → envoie toutes les fiches en .txt\n"
-            "• /num <numéro> → cherche et renvoie la/les fiche(s)\n",
+            "• /num <numéro> → cherche et renvoie la/les fiche(s)\n"
+            "• /load → intègre le(s) fichier(s) que tu as uploadés\n",
             parse_mode=ParseMode.HTML
         )
 
@@ -179,6 +188,84 @@ class App:
         for q in queries:
             await self._reply_with_results(update, q)
 
+    async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Sauvegarde le fichier uploadé dans uploads/ et mémorise pour /load."""
+        doc = update.message.document
+        if not doc:
+            await update.message.reply_text("Aucun fichier détecté.")
+            return
+
+        uploads_dir = os.path.join(os.getcwd(), "uploads")
+        os.makedirs(uploads_dir, exist_ok=True)
+
+        # Nom unique avec timestamp
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{stamp}_{doc.file_name}"
+        dest_path = os.path.join(uploads_dir, filename)
+
+        try:
+            file = await doc.get_file()
+            await file.download_to_drive(dest_path)
+        except Exception as e:
+            await update.message.reply_text(f"Erreur lors du téléchargement du fichier: {e}")
+            return
+
+        # Sauvegarde dans bot_data pour cette conversation (ou utilisateur)
+        chat_id = update.effective_chat.id
+        key = f"uploads_{chat_id}"
+        lst = context.application.bot_data.get(key, [])
+        lst.append(dest_path)
+        context.application.bot_data[key] = lst
+
+        await update.message.reply_text(
+            f"Fichier reçu: {doc.file_name}\nEnregistré. Envoie maintenant /load pour le traiter."
+        )
+
+    async def cmd_load(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Concatène les fichiers uploadés au CSV et recharge l'index."""
+        chat_id = update.effective_chat.id
+        key = f"uploads_{chat_id}"
+        uploads = context.application.bot_data.get(key, [])
+
+        if not uploads:
+            await update.message.reply_text("Aucun fichier à charger. Envoie d'abord un fichier au bot.")
+            return
+
+        added_lines = 0
+        # On crée le fichier data.csv s'il n'existe pas et on tente d'ajouter
+        if not os.path.exists(self.csv_path):
+            # create file with a default header if possible
+            # If the uploaded file is a CSV with header, we'll append as-is
+            open(self.csv_path, "a", encoding="utf-8").close()
+
+        for up in uploads:
+            try:
+                # On va ouvrir le fichier uploadé en mode texte et l'ajouter tel quel
+                with open(up, "r", encoding="utf-8", errors="replace") as fsrc, \
+                     open(self.csv_path, "a", encoding="utf-8") as fdst:
+                    lines_before = 0
+                    with open(self.csv_path, "r", encoding="utf-8", errors="replace") as t:
+                        lines_before = sum(1 for _ in t)
+                    written = 0
+                    for line in fsrc:
+                        # Skip empty lines
+                        if line.strip() == "":
+                            continue
+                        fdst.write(line.rstrip("\n") + "\n")
+                        written += 1
+                    # Estimation simple: nombre de lignes écrites
+                    added_lines += written
+            except Exception as e:
+                await update.message.reply_text(f"Erreur lors de la lecture de {os.path.basename(up)} : {e}")
+
+        # Clear the list for this chat
+        context.application.bot_data[key] = []
+
+        # Reload index
+        self.index, self.total, self.indexed, self.all_rows = load_index(self.csv_path)
+        msg = f"✅ {added_lines} fiches ajoutées (approx.). Total: {self.total}"
+        await update.message.reply_text(msg)
+
     async def _reply_with_results(self, update: Update, q: str):
         normalized = normalize_fr(q)
         results: List[Dict[str, str]] = []
@@ -221,7 +308,9 @@ def main():
     if not token:
         raise SystemExit("Veuillez éditer .env et mettre BOT_TOKEN=...")
     if not os.path.exists(csv_path):
-        raise SystemExit(f"Fichier CSV introuvable: {csv_path}")
+        # create empty CSV file to avoid crashes
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("") 
     App(token, csv_path).start()
 
 if __name__ == "__main__":
